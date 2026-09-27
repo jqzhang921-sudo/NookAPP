@@ -6,7 +6,15 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import io.flutter.plugin.common.MethodChannel
+
+/**
+ * 从播放器**自己那条通知**里读到的歌名/歌手。
+ *
+ * 和 [MediaMetadata] 是同一件事的两个来源，但质量差很远——见 [MusicBridge.noticeFor]。
+ */
+data class NoticeTrack(val title: String, val artist: String?)
 
 /**
  * 系统里正在播放的那个媒体会话，以及往 Dart 推事件的那根管子。
@@ -44,6 +52,9 @@ import io.flutter.plugin.common.MethodChannel
  */
 object MusicBridge {
 
+    /** 和 [MusicListenerService] 共用一个 tag，这样 `-s MusicSession` 能一次捞全。 */
+    private const val TAG = "MusicSession"
+
     /** 曲目信息是上一次缓存来的（当前这次读到的是空的）。见类注释。 */
     const val KEY_STALE = "stale"
 
@@ -72,6 +83,40 @@ object MusicBridge {
      */
     var activeController: MediaController? = null
         private set
+
+    /**
+     * 「这个包现在把哪首歌挂在它自己的通知上」——由 [MusicListenerService] 在
+     * 连上的时候装进来，断开时清掉。null = 那个服务没在跑，那就只能信会话。
+     *
+     * ## 为什么非得拐这一道
+     *
+     * ⚠️ **会话里的 `METADATA_KEY_TITLE` 不是歌名**，至少 QQ音乐 上不是。
+     * 2026-09-27 在真机上实测，同一首 `Groovin'` 播放中每 1–3 秒 title 栏就换
+     * 一次，换的是**当前这句歌词**：
+     *
+     * ```
+     * Groovin' - Jeff Bernat          ← 刚起播
+     * Please just take my hand        ← 歌词
+     * Maybe you're willing and able   ← 歌词
+     * ```
+     *
+     * 歌手栏也被糊了（`Groovin'-Jeff Bernat`，歌名和歌手粘成一栏、空格都没了），
+     * 而且**暂停和播放还是两副面孔**——暂停时又变回干净的
+     * `Groovin'` / `Jeff Bernat`。它在拿会话的 title 栏驱动状态栏歌词。
+     *
+     * 这一路串下去是灾难：[snap] 每读一次 title 都不一样，[refresh] 于是把
+     * **每一句歌词都当成一次换歌**，`_closeListen` / `_openListen` 跟着开合，
+     * 听歌流水整个坏掉——而第三期判「这首你听了十秒就切了」全靠那份流水。
+     * 界面上的歌名也会跟着歌词闪。
+     *
+     * 干净的那一份就在它自己的通知里：`EXTRA_TITLE` 是歌名、`EXTRA_TEXT` 是
+     * `歌手 - …`。两家都准，而且**网易云暂停后会把会话元数据清空、通知里那行
+     * 歌名却照样在**——当初逼我们做 [lastTrack] 兜底的那个坑，也顺带轻了一半。
+     *
+     * 所以规矩是：**通知优先，会话兜底**。
+     */
+    @Volatile
+    var noticeFor: ((String) -> NoticeTrack?)? = null
 
     fun attach(channel: MethodChannel) {
         this.channel = channel
@@ -210,9 +255,20 @@ object MusicBridge {
             prev["artist"] != snapped["artist"]
         val stateChanged = prev == null || prev["state"] != snapped["state"]
         if (!trackChanged && !stateChanged) return
+        val type = if (trackChanged) "track" else "state"
+
+        // ⚠️ 这一行是「假换歌」那件事的判据，别当调试残留删掉。
+        //
+        // QQ音乐 播放中每 1–3 秒就有一次 metadata 回调，每一次都会走到这里。
+        // 改 [noticeFor] 之前，每一次都判成 `track`（title 栏里换成下一句歌词
+        // 了），听歌流水于是被假记录刷满。改完之后**一首歌从起播到放完，这里
+        // 应该只出现一条 `推 track`**。
+        //
+        // 看这一行的节奏就能判断修没修好，不用去翻 Dart 那边的状态。
+        Log.i(TAG, "推 $type：${snapped["title"]} - ${snapped["artist"]}")
 
         val event = snapped.toMutableMap()
-        event["type"] = if (trackChanged) "track" else "state"
+        event["type"] = type
         emit(event)
     }
 
@@ -226,8 +282,13 @@ object MusicBridge {
     private fun snap(c: MediaController): MutableMap<String, Any?> {
         val pkg = c.packageName.orEmpty()
 
-        val fresh = c.metadata?.let { readTrack(it, pkg) }
-        if (fresh != null) lastTrack = fresh
+        var fresh = c.metadata?.let { readTrack(it, pkg) }
+        if (fresh != null) {
+            fresh = withNoticeTitle(fresh, pkg)
+            // ⚠️ 存进去的必须是**盖过之后**的那一份：这个缓存要在会话元数据被
+            // 清空时顶上（网易云暂停就会清），带着脏歌名进缓存等于把坑挪个地方。
+            lastTrack = fresh
+        }
 
         // 读不到就退回上次那首，并打上 stale 标记。
         val track = fresh ?: lastTrack
@@ -269,6 +330,10 @@ object MusicBridge {
      *
      * ARTIST 之外还兜底 ALBUM_ARTIST / DISPLAY_SUBTITLE：各家音乐 App 字段
      * 填得不一致，实测网易云给的是 ARTIST，但不能假定别的 App 也给。
+     *
+     * ⚠️ 这里读出来的 title/artist **只当草稿**，真正用之前还会过一遍
+     * [withNoticeTitle]：QQ音乐 会把滚动歌词写进 title、把歌名歌手粘成一栏塞进
+     * artist，光看这里会以为那是对的。
      */
     private fun readTrack(md: MediaMetadata, pkg: String): Map<String, Any?>? {
         val title = md.getString(MediaMetadata.METADATA_KEY_TITLE)
@@ -288,6 +353,27 @@ object MusicBridge {
             // 知道「这个数没有」，而不是「这个数是零」。
             "durationMs" to (if (duration > 0) duration else null),
         )
+    }
+
+    /**
+     * 拿通知里那行歌名/歌手，盖掉会话报的。见 [noticeFor] 那段实测记录。
+     *
+     * ⚠️ **只换 `title` 和 `artist` 两栏**。时长和专辑留会话的：通知里压根没有
+     * 这两个东西，顺手一起盖的话 `durationMs` 会变成 null，而第三期判「这首是
+     * 不是听完了」全靠那个数。
+     *
+     * [NoticeTrack.artist] 是 null 的时候（通知第二行不是「歌手 - …」的样子）
+     * 留着会话报的歌手——**宁可丑，不要假**。
+     */
+    private fun withNoticeTitle(
+        session: Map<String, Any?>,
+        pkg: String,
+    ): Map<String, Any?> {
+        val notice = noticeFor?.invoke(pkg) ?: return session
+        return session.toMutableMap().apply {
+            put("title", notice.title)
+            put("artist", notice.artist ?: session["artist"])
+        }
     }
 
     /**

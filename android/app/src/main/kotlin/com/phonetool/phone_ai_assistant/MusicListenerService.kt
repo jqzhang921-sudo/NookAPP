@@ -1,5 +1,6 @@
 package com.phonetool.phone_ai_assistant
 
+import android.app.Notification
 import android.content.ComponentName
 import android.content.Context
 import android.content.pm.PackageManager
@@ -8,6 +9,8 @@ import android.media.session.MediaController
 import android.media.session.MediaSession
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.Bundle
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.util.Log
 
@@ -45,6 +48,16 @@ class MusicListenerService : NotificationListenerService() {
 
     companion object {
         private const val TAG = "MusicSession"
+
+        /**
+         * 从通知里读到的歌名缓存多久（毫秒）。**别删**，见 [noticeFor]。
+         *
+         * 取 250ms 的依据：风暴里回调间隔约 3ms，250ms 能把 ~80 次塌成 1 次；
+         * 而换歌时仍然读得到新歌，因为**两首歌之间本来就隔着比这长得多的时间**
+         * （真机实测 2.7 秒），进新歌时缓存早凉了。最坏情况是自动连播时晚
+         * 250ms 认出换歌——不影响任何事。
+         */
+        private const val NOTICE_TTL_MS = 250L
 
         /**
          * 自己这一份 ComponentName。`getActiveSessions` 要它。
@@ -133,6 +146,31 @@ class MusicListenerService : NotificationListenerService() {
 
     private var manager: MediaSessionManager? = null
 
+    /**
+     * 交给 [MusicBridge] 的那个读通知的钩子。
+     *
+     * 存成字段而不是每次现造一个 lambda，是为了**摘的时候能认出是不是自己**——
+     * 系统重绑的瞬间可能新旧两个实例同时在，旧的 `onDestroy` 要是无脑把
+     * `noticeFor` 清掉，刚装上的那一个就白装了，症状是「歌名又变回滚动歌词」，
+     * 而这种情况没有任何日志会指向这里。
+     */
+    private val noticeHook: (String) -> NoticeTrack? = { pkg -> noticeFor(pkg) }
+
+    /**
+     * 读到的通知按包名缓存，见 [NOTICE_TTL_MS]。
+     *
+     * 存 [CachedNotice] 而不是直接存 [NoticeTrack]——**得能区分「没读过」和
+     * 「读过，但当时读不到」**。后者也要缓存：通知读不到的那段时间里，
+     * 每次回调都还会各打一次 binder 白跑。
+     *
+     * 只在主线程碰（会话回调、MethodChannel 处理都在主线程），所以不用并发容器。
+     * 键是包名，撑死几个音乐 App，不用淘汰。
+     */
+    private val noticeCache = HashMap<String, CachedNotice>()
+
+    /** [noticeCache] 的值。[track] 可以是 null——那是「读过但没有」的意思。 */
+    private class CachedNotice(val at: Long, val track: NoticeTrack?)
+
     /** 当前挂上回调的会话，**保持顺序**——getActiveSessions 是按优先级排的。 */
     private var bound = listOf<MediaController>()
 
@@ -165,6 +203,11 @@ class MusicListenerService : NotificationListenerService() {
         Log.i(TAG, "✅ onListenerConnected —— 拿到门票了")
         connected = true
 
+        // 把「从通知里读干净歌名」这一手交给 [MusicBridge]。**读通知本来就是
+        // 这个服务的本职**（我们就是个通知监听器），所以这条路不用再要权限。
+        // 为什么非要它不可，见 MusicBridge.noticeFor 那段实测记录。
+        MusicBridge.noticeFor = noticeHook
+
         val mgr = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
         if (mgr == null) {
             Log.e(TAG, "❌ 拿不到 MediaSessionManager，这台机器上没法做")
@@ -193,6 +236,7 @@ class MusicListenerService : NotificationListenerService() {
         Log.w(TAG, "⚠️ onListenerDisconnected —— 系统把我们解绑了")
         connected = false
         unbindAll()
+        dropNoticeHook()
         manager?.removeOnActiveSessionsChangedListener(onSessionsChanged)
         manager = null
         // 主动要一次重绑。ColorOS 上不保证成功（这也是界面那边要留一个
@@ -209,6 +253,7 @@ class MusicListenerService : NotificationListenerService() {
         Log.i(TAG, "onDestroy")
         connected = false
         unbindAll()
+        dropNoticeHook()
         manager?.removeOnActiveSessionsChangedListener(onSessionsChanged)
         manager = null
         // 服务没了，但**不清 MusicBridge 的状态**——界面还在的话，让它继续显示
@@ -295,7 +340,7 @@ class MusicListenerService : NotificationListenerService() {
      * 挑错的症状是——界面显示 B 站的视频标题，而用户明明在听歌。
      *
      * 判据按可靠程度排：
-     *   1. 正在放的（STATE_PLAYING）——最强信号
+     *   1. 在出声的（[isAudible]）——最强信号
      *   2. 退一步，有歌名的（暂停中的也算，用户按了暂停不代表没在听那首）
      *   3. 再退，有会话就算
      *
@@ -303,31 +348,164 @@ class MusicListenerService : NotificationListenerService() {
      */
     private fun pick(): MediaController? {
         if (bound.isEmpty()) return null
-        return bound.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+        return bound.firstOrNull { it.isAudible() }
             ?: bound.firstOrNull { !it.titleOrNull().isNullOrBlank() }
             ?: bound.first()
+    }
+
+    /**
+     * 这个会话在出声没有。**缓冲也算。**
+     *
+     * ⚠️ 2026-09-27 补：原先只认 `STATE_PLAYING`，漏了 `STATE_BUFFERING`。
+     * 那条判据的用途是「从一堆活着的会话里挑出她正在听的那个」，而缓冲中的
+     * 播放器显然就是她正在听的那个。
+     *
+     * 漏掉的后果不是随机的：两台播放器**可以同时活着**（实测这台机器上网易云的
+     * 会话从 19:44 一直挂到 21:30 都没死，进程也没死，只是 paused），第一判据
+     * 踏空之后就落到「谁有歌名」上——那是按 `getActiveSessions` 的返回顺序，
+     * 而那个顺序**只大致按最近活跃排，不保证**。撞上的症状是界面显示上一首
+     * 还在网易云里的歌，耳朵里响的却是 QQ音乐。
+     *
+     * Dart 那边 `MusicService._audible` 早就是把 buffering 算成「在放」的
+     * （见那边的注释：网易云正常播着就在 playing/buffering 之间来回跳），
+     * 这里跟它对齐。
+     */
+    private fun MediaController.isAudible(): Boolean {
+        val s = playbackState?.state ?: return false
+        return s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_BUFFERING
     }
 
     private fun MediaController.titleOrNull(): String? =
         metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)
 
-    /** 给 logcat 看的一行摘要。字段和 MusicBridge 读的是同一批。 */
+    /** 只摘自己装的那一个钩子。见 [noticeHook] 的注释。 */
+    private fun dropNoticeHook() {
+        if (MusicBridge.noticeFor === noticeHook) MusicBridge.noticeFor = null
+    }
+
+    /**
+     * 这个包现在挂在通知上的歌名/歌手，**带 [NOTICE_TTL_MS] 缓存**。
+     *
+     * ## 为什么要缓存
+     *
+     * ⚠️ 这一层不是「顺手优化」，是**换歌那一瞬间不卡的必要条件**。实测
+     * QQ音乐 换一首歌会在 0.5 秒内打 109 次回调（89 次元数据 + 20 次播放状态），
+     * 每一次都要走 [MusicBridge.snap] → 这里，而 [readNotice] 里那句
+     * `activeNotifications` 是**一次跨进程 binder 往返**、还在主线程上。
+     * 不缓存就是每换一首都拿小半秒的主线程，去反复换一个**根本不会变**的结果
+     * ——那 109 次读到的其实是同一张通知。
+     *
+     * 真机实测：一场换歌风暴 0.5 秒里 109 次回调；没有缓存的话，每一次都要
+     * 打一次 binder。加了 250ms 的窗口之后，同一场风暴里最多读 1–2 次。
+     *
+     * ⚠️ 别把它说成「实测省了 0.3 秒卡顿」——**回调的节奏是 QQ音乐 自己发的**，
+     * 实测间隔跟着它的发射速率走（换歌那 0.5 秒里 5–10ms 一次），主线程并不
+     * 是限速的那一环。这里省下的是实实在在的工作量（每换一首少约 100 次跨进程
+     * 往返），但**没有测到帧时间因此变好**。
+     *
+     * 诊断（[describe]）要的是**此刻**的真相，走 [readNotice] 绕开这里。
+     */
+    private fun noticeFor(pkg: String): NoticeTrack? {
+        val now = SystemClock.elapsedRealtime()
+        val hit = noticeCache[pkg]
+        if (hit != null && now - hit.at < NOTICE_TTL_MS) return hit.track
+
+        val fresh = readNotice(pkg)
+        noticeCache[pkg] = CachedNotice(now, fresh)
+        return fresh
+    }
+
+    /**
+     * 真的去读一次活动通知。**不带缓存**——缓存在 [noticeFor] 里。
+     *
+     * 这一份才是干净的歌名，前因后果见 [MusicBridge.noticeFor] 那段实测记录。
+     *
+     * 挑哪一条通知：同包 + `category=transport`。实测 QQ音乐 那条是
+     * `category=transport`，网易云也是；用 category 而不是去比 `EXTRA_MEDIA_SESSION`
+     * 里那个 token，是因为 token 的读取在 API 33 之后分了新旧两套写法，而
+     * category 这一条从 API 21 到现在没动过。
+     *
+     * 读不到就返回 null，上层退回会话里那一份——**这条路上任何一步失败都不该
+     * 让整件事停下来**，最坏的结果只是歌名又变回滚动歌词。
+     */
+    private fun readNotice(pkg: String): NoticeTrack? {
+        val list = try {
+            activeNotifications
+        } catch (e: Exception) {
+            // 服务刚断、或者系统那边不让读。不吵：这是降级，不是故障。
+            Log.w(TAG, "读不到活动通知，歌名只能会话里那一份了", e)
+            return null
+        } ?: return null
+
+        val n = list.firstOrNull {
+            it.packageName == pkg && it.notification?.category == Notification.CATEGORY_TRANSPORT
+        }?.notification ?: return null
+
+        val title = n.extras.getCharSequence(Notification.EXTRA_TITLE)
+            ?.toString()?.trim().orEmpty()
+        if (title.isBlank()) return null
+        return NoticeTrack(title = title, artist = artistFromNotice(n.extras, title))
+    }
+
+    /**
+     * 通知第二行是 `歌手 - 别的`，**两家都是歌手打头**：
+     * QQ音乐 给的是 `Jeff Bernat - The Gentleman Approach`（歌手 - 专辑），
+     * 网易云 给的是 `Jada Facer - Float`（歌手 - 歌名）。
+     * 后头跟的是专辑还是歌名各家不一样，但歌手都在最前面，所以取第一个
+     * 「 - 」前面那截。
+     *
+     * 取出来跟歌名一模一样、或者是空的，就说明这一行根本不是那个格式——
+     * **宁可不给**，让上层留着会话报的歌手（丑一点但至少不是编的），
+     * 也好过塞一个假的进去。
+     */
+    private fun artistFromNotice(extras: Bundle, title: String): String? {
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)
+            ?.toString()?.trim().orEmpty()
+        if (text.isBlank()) return null
+        val head = text.substringBefore(" - ").trim()
+        if (head.isBlank() || head == title) return null
+        return head
+    }
+
+    /**
+     * 给 logcat 看的一行摘要。
+     *
+     * ⚠️ **会话那一份和通知那一份都要打**，因为它们经常不一样——QQ音乐 的会话
+     * 里歌名栏是滚动歌词（见 [MusicBridge.noticeFor]）。只打一行的话，两边恰好
+     * 一样时分不清「通知本来就干净」和「压根没读到通知」，而这两种情况下
+     * 真正会用的那份是不同的。
+     */
     private fun describe(c: MediaController): String {
         val md = c.metadata
         val ps = c.playbackState
-        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE)
-        val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+        val sTitle = md?.getString(MediaMetadata.METADATA_KEY_TITLE)
+        val sArtist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
         val dur = md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L
+        // 走 readNotice 绕开缓存：这一行是诊断，要的是**此刻**的通知长什么样。
+        // 缓存只差 250ms，但诊断的价值全在「准」上，而这里一次会话变动才调一次。
+        val notice = readNotice(c.packageName.orEmpty())
         return buildString {
             append("  [${c.packageName}] ")
-            if (title.isNullOrBlank() && artist.isNullOrBlank()) {
+            if (sTitle.isNullOrBlank() && sArtist.isNullOrBlank()) {
                 // 这条日志是「元数据被清空」那个坑的现场证据，别当成没在放歌。
                 append("（元数据为空，session 还活着）")
             } else {
-                append("《$title》")
-                if (!artist.isNullOrBlank()) append(" - $artist")
+                append("会话《$sTitle》")
+                if (!sArtist.isNullOrBlank()) append(" - $sArtist")
                 if (dur > 0) append(" (${dur / 1000}s)")
             }
+            append("｜通知")
+            append(
+                if (notice == null) "（没读到，用会话那份）"
+                else buildString {
+                    append("《${notice.title}》")
+                    if (notice.artist != null) {
+                        append(" - ${notice.artist}")
+                    } else {
+                        append("（歌手没取到，留会话的）")
+                    }
+                },
+            )
             append(" state=${ps?.state} actions=${ps?.actions} pos=${ps?.position}")
         }
     }

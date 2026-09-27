@@ -669,6 +669,15 @@ class MusicTrack {
     if (package != other.package) return false;
     // 只比 title。同一首歌的两个版本（remaster / live）会共用一个 title 但
     // duration 不同——那种当「同一首」比当「换歌了」更接近用户的感受。
+    //
+    // ⚠️ **这条成立的前提是 `title` 真的是歌名**，而它会假——原生那边读的是
+    // 媒体会话的 `METADATA_KEY_TITLE`，QQ音乐 播放中往那一栏里写的是**滚动
+    // 歌词**（1–3 秒换一句），于是每一句歌词都会走到「换了首歌」那一支，
+    // 听歌流水被假记录刷满。现在那条路由 `MusicBridge.noticeFor` 兜住了：
+    // 原生侧优先用播放器自己通知里的歌名，会话那一份只在读不到通知时才用。
+    //
+    // 所以这里的判据本身没改，改的是**上游喂进来的东西**。哪天要动
+    // `noticeFor`，先回来看一眼这段。
     return title == other.title;
   }
 
