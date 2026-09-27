@@ -290,6 +290,74 @@ void main() {
     });
   });
 
+  group('听歌时顺手看一眼屏幕', () {
+    // 这一组的重点**不是截图成不成**，是**什么时候根本不截**。她在别的 App
+    // 上的画面不该存在过，所以那几条要钉死。
+
+    test('屏幕上正是那个在放歌的 App：可以看', () {
+      expect(
+        musicGlanceTarget(
+          playing: 'com.netease.cloudmusic',
+          front: 'com.netease.cloudmusic',
+        ),
+        isTrue,
+      );
+      // 歌词页、播放页、设置页——都是同一个包，都算。
+      expect(
+        musicGlanceTarget(
+          playing: 'com.netease.cloudmusic',
+          front: 'com.netease.cloudmusic',
+        ),
+        isTrue,
+      );
+    });
+
+    test('⚠️ 她在任何别的 App 里：不看', () {
+      for (final front in [
+        'com.tencent.mm', // 微信
+        'com.eg.android.AlipayGphone', // 支付宝
+        'com.android.gallery3d', // 相册
+        'com.phonetool.phone_ai_assistant', // 她自己就在 Nook 里
+        'com.android.launcher', // 桌面
+      ]) {
+        expect(
+          musicGlanceTarget(playing: 'com.netease.cloudmusic', front: front),
+          isFalse,
+          reason: '前台是 $front 的时候一次都不该截',
+        );
+      }
+    });
+
+    test('没有在放的播放器：不看', () {
+      expect(musicGlanceTarget(playing: null, front: 'com.netease.cloudmusic'), isFalse);
+      expect(musicGlanceTarget(playing: '', front: 'com.netease.cloudmusic'), isFalse);
+    });
+
+    test('前台查不出来：不看', () {
+      // 锁屏、灭屏、排除名单里——`check` 这会儿不回包名，那就不看。
+      expect(
+        musicGlanceTarget(playing: 'com.netease.cloudmusic', front: null),
+        isFalse,
+      );
+    });
+
+    test('30 分钟那道闸', () {
+      final t = at(15);
+      expect(musicGlanceDue(now: t, lastAt: null), isTrue, reason: '从没看过');
+      expect(
+        musicGlanceDue(now: t, lastAt: t.subtract(const Duration(minutes: 29))),
+        isFalse,
+      );
+      expect(
+        musicGlanceDue(now: t, lastAt: t.subtract(const Duration(minutes: 31))),
+        isTrue,
+      );
+      // ⚠️ 按**看**算不按「说不说」算：看了没说话，这 30 分钟照样算用过了，
+      // 不然下一次换歌又来一张，留痕就成了刷屏。
+      expect(musicGlanceGap, const Duration(minutes: 30));
+    });
+  });
+
   group('别把同一天过第二遍', () {
     test('换了标点和语序，仍然算同一句', () {
       const recent = ['我刚写完一封信，放在栖息里了'];

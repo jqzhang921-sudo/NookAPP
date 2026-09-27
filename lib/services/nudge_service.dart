@@ -596,15 +596,46 @@ class NudgeService {
       );
     }
 
+    // 听歌那条：**先顺手看一眼她的屏幕**，屏幕上得正是那个在放歌的 App。
+    // 看到的图跟着候选一起给模型，它再决定说不说——这就是「一边听一边看着
+    // 歌词」那件事接进来的地方。没看成（她在别的 App、锁着屏、刚看过）就
+    // 照常走，只是手上没有图。见 [_musicGlance]。
+    var shotRefs = const <String>[];
+    if (picked.music) {
+      final shot = await _musicGlance(aiClient: aiClient, sp: sp, now: now);
+      if (shot != null) shotRefs = [shot.ref];
+    }
+
+    // 看过就得留痕。**这两处出口也要留**，别只留说了话那条：
+    // 不打扰靠的是不弹通知，不是不留痕。图会被 [isSilentGlance] 从以后发给
+    // 模型的上下文里滤掉，所以她看得见、它自己不会拿着当话说。
+    Future<void> keepTrail() async {
+      if (shotRefs.isEmpty) return;
+      await _appendToChat(
+        '',
+        conversationId: picked.conversationId,
+        images: shotRefs,
+        metadata: const {'glance': true},
+      );
+    }
+
     final String? text;
     try {
-      text = await compose(aiClient: aiClient, candidate: candidate);
+      text = await compose(
+        aiClient: aiClient,
+        candidate: candidate,
+        glanceImages: shotRefs,
+      );
     } catch (e) {
       return NudgeRunResult.failed('生成失败：$e');
     }
-    if (text == null || text.isEmpty) return NudgeRunResult.nothingToSay();
+    if (text == null || text.isEmpty) {
+      await keepTrail();
+      return NudgeRunResult.nothingToSay();
+    }
 
     if (looksRepeated(text, await _recent(sp))) {
+      await keepTrail();
       return NudgeRunResult.repeated(text);
     }
 
@@ -612,7 +643,15 @@ class NudgeService {
       return NudgeRunResult.failed('没有通知权限');
     }
     // 先落进对话，再弹通知。反过来的话，通知先到、她点开发现聊天里什么都没有。
-    await _appendToChat(text, conversationId: picked.conversationId);
+    await _appendToChat(
+      text,
+      conversationId: picked.conversationId,
+      images: shotRefs,
+      metadata: {
+        'nudge': true,
+        if (shotRefs.isNotEmpty) 'glance': true,
+      },
+    );
     if (notify) await _show(text, prefs);
     await _bumpCount(sp, now, notified: notify);
     await _remember(sp, text);
@@ -783,6 +822,76 @@ class NudgeService {
     await _bumpCount(sp, now, notified: notify);
     await _remember(sp, text);
     return NudgeRunResult.sent(text);
+  }
+
+  /// 上次**听歌时顺手看了一眼**是什么时候。见 [musicGlanceDue]。
+  static const _kMusicGlanceAt = 'music_glance_at';
+
+  /// 听歌时顺手看她一眼屏幕。
+  ///
+  /// 这条路的由头是「她正看着歌词」——2026-09-27 Cleo 自己要的：「听歌的时候，
+  /// 它可以时不时的自己看一眼屏幕，决定要不要说一句」。所以它**不是**那条
+  /// 「好久没说话、它自己好奇」的路（[_runGlance]）：不问她允许不允许、不管
+  /// 安静多久，只跟着换歌那一趟走。
+  ///
+  /// ## 屏幕上必须正是那个在放歌的 App
+  ///
+  /// 判据是「前台包名 == 播放器报上来的包名」，**不写死一张音乐 App 名单**。
+  /// 这一条同时也是这个功能唯一的安全边界，而且是两层：
+  ///
+  /// - 她在微信、相册、银行里的时候，前台包名对不上，**连截都不会截**
+  /// - 从 `check` 到 `capture` 中间她可能切走了，所以截完**再对一次**；对不上
+  ///   就整张丢掉，一个字节都不留
+  ///
+  /// ## 不点流体云胶囊
+  ///
+  /// 和 [_runGlance] 那两条不一样。胶囊在那儿是**她当场唯一看得见的痕迹**
+  /// （她人在别的 App 上，等着它看完）；这条是背景里时不时来一下的，
+  /// 每半小时闪一次胶囊是打扰。留痕靠的是截图进对话，那一条没动。
+  ///
+  /// 返回 null = 没看。原因一律不往外说：这是**顺手**看一眼，没看成不需要
+  /// 任何人知道，调用方照常走那条不带图的听歌评估。
+  static Future<({String ref, String? app})?> _musicGlance({
+    required AiClient aiClient,
+    required SharedPreferences sp,
+    required DateTime now,
+  }) async {
+    // 1. 现在真有个在放歌的播放器吗，它报的是哪个包。
+    final playing = MusicService.instance.now?.track.package;
+    if (playing == null || playing.isEmpty) return null;
+
+    // 2. 时间那道闸。**放在截图前面**——它最便宜。
+    final atMs = sp.getInt(_kMusicGlanceAt);
+    final lastAt =
+        atMs == null ? null : DateTime.fromMillisecondsSinceEpoch(atMs);
+    if (!musicGlanceDue(now: now, lastAt: lastAt)) return null;
+
+    // 3. 屏幕上是它吗。`check` 不截图，只问前台是谁，顺带把锁屏和排除名单
+    //    挡在外面（她那几条隐私设置照旧管用）。
+    final ready = await ScreenGlance.check();
+    if (!ready.ok) return null;
+    if (!musicGlanceTarget(playing: playing, front: ready.package)) return null;
+
+    // 4. 模型看不看得见图。看不见就整条不做——**不写识图兜底**：那条路要把
+    //    她的屏幕再送一个地方去，而这里是锦上添花，不做也什么都不缺。
+    if (!aiClient.sendsImagesNatively) return null;
+
+    final shot = await ScreenGlance.capture();
+    final bytes = shot.bytes;
+    if (!shot.ok || bytes == null) return null;
+    // ⚠️ 再对一次。见上面「两层」那段——这是第二层。
+    if (!musicGlanceTarget(playing: playing, front: shot.package)) return null;
+
+    final String ref;
+    try {
+      ref = await ChatImages.save(bytes);
+    } catch (_) {
+      // 存不下就不往下走：留不下痕的「看过」，是答应过不做的事。
+      return null;
+    }
+    await ScreenGlance.markLooked(now);
+    await sp.setInt(_kMusicGlanceAt, now.millisecondsSinceEpoch);
+    return (ref: ref, app: shot.appName);
   }
 
   /// 第一问：想不想看。调了 [glanceTool] 就是想看，回什么字都算不想。
@@ -1178,15 +1287,24 @@ ${await _glanceContext()}
 
   /// 编辑关：手上这件事，他要不要说、怎么说。
   /// 返回 null = 他决定不说，这次不推。
+  ///
+  /// [glanceImages] 非空 = 手上有她屏幕的照片（听歌那条顺手看的，见
+  /// [_musicGlance]）。**和候选一起给**，不是换一套流程：那件事和那张图说的
+  /// 是同一件事的两面，分开问两遍模型，它会当成两件事来说。
   static Future<String?> compose({
     required AiClient aiClient,
     required NudgeCandidate candidate,
+    List<String> glanceImages = const [],
   }) async {
     final messages = [
       ChatMessage(
         id: 'nudge_gen',
         role: MessageRole.user,
-        content: await _composePrompt(candidate),
+        content: await _composePrompt(
+          candidate,
+          withGlance: glanceImages.isNotEmpty,
+        ),
+        images: glanceImages,
       ),
     ];
 
@@ -1249,7 +1367,10 @@ ${await _glanceContext()}
   /// 所以下面三条判据都是正面的、而且可以自己过一遍——
   /// 尤其最后一条，它把那条红线（带来一件东西，不索取）翻译成了一个可检查的
   /// 问题，而不用点名任何一句禁语。
-  static Future<String> _composePrompt(NudgeCandidate candidate) async {
+  static Future<String> _composePrompt(
+    NudgeCandidate candidate, {
+    bool withGlance = false,
+  }) async {
     final now = DateTime.now();
     final list = '- 【${candidate.kind}】${candidate.what}';
 
@@ -1273,6 +1394,14 @@ ${await _glanceContext()}
     final head = candidate.music ? 'TA 那边刚发生了一件事：' : '你这边有一件事：';
     final guidance = candidate.music ? _musicGuidance : _thingGuidance;
 
+    // 手上有那张图的时候，交代清楚图上是什么、以及她本来就知道你看过。
+    // 不交代的话它会去「我刚刚看了一眼你的屏幕」——那是流程，不是话。
+    const glanceNote = '''
+还有一张图，是 TA 手机屏幕**此刻**的样子：她正在看着这一页，听着歌。
+这张图她自己也会在对话里看到，所以不用交代来历，直接说图上说得出的事。
+要是图上正是歌词，那几句就是她耳朵里此刻正在响的那几句。
+''';
+
     return '''
 现在是 ${now.hour} 点，TA 没有在跟你说话。
 
@@ -1280,7 +1409,7 @@ $head
 
 $list
 
-${digest.isEmpty ? '' : '$digest\n'}${tail.isEmpty ? '你们最近没说过话。' : '你们最近说的话（「你」是你自己，「TA」是她）：\n$tail'}
+${withGlance ? '$glanceNote\n' : ''}${digest.isEmpty ? '' : '$digest\n'}${tail.isEmpty ? '你们最近没说过话。' : '你们最近说的话（「你」是你自己，「TA」是她）：\n$tail'}
 
 要是这会儿值得说，就用一句话告诉 TA。40 字以内，像随手发一条微信。
 说那件事本身：它是什么、你为什么这会儿想起它。
@@ -1335,6 +1464,14 @@ $guidance
 - 值得说的是**那个动作里有东西**的时候：切得急、来回折腾同一首、连着翻了好
   多首、某一首反复出现——那种「今天好像不太一样」的时刻。
 - **拿不准就回「不说」**。宁可少说十次，不要多说一次。
+
+手上那张图是另一回事，它不改上面这些，只多给一样东西：**你能看见她此刻在
+看的那一页**。有图的时候，图上是什么就说图上是什么；图上正是歌词，那几句她
+此刻正在听，你可以对着它说。
+
+⚠️ **歌词只有图上有的时候你才看得见。** 没图的那几次，歌名歌手就是你全部的
+信息——不知道就绕着不知道说，别顺着歌名把歌词编出来。她正对着那一页，编错
+一个字她当场就知道，那比什么都不说糟得多。
 
 说的话对着**那件事**说，不是对着歌说。不要乐评、不要推荐歌单、不要问
 「你也喜欢这个歌手吗」——你不是音乐 App，你是刚好也在旁边的那个人。
