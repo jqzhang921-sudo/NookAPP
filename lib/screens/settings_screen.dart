@@ -22,6 +22,7 @@ import '../services/tts_service.dart';
 import '../services/vision_service.dart';
 import '../services/weread_service.dart';
 import 'app_usage_screen.dart';
+import 'music_screen.dart';
 import 'tools_screen.dart';
 import 'musing_corner_screen.dart';
 import 'persona_screen.dart';
@@ -643,6 +644,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onTap:
                   () => Navigator.of(context).push(
                     MaterialPageRoute(builder: (_) => const AppUsageScreen()),
+                  ),
+            ),
+            // 紧挨着上面那条放：两条都是「感知」类，而且都是**系统权限要不来、
+            // 得你自己去设置里开**的那种。放一起她一眼能看明白这一组是什么。
+            _row(
+              theme,
+              icon: PhosphorIconsRegular.musicNotes,
+              title: '一起听',
+              subtitle: '能看到你在放什么歌，也能帮你切',
+              onTap:
+                  () => Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const MusicScreen()),
                   ),
             ),
             _row(

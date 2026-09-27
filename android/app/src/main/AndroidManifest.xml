@@ -61,6 +61,37 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- 「一起听歌」：读系统里正在播放的媒体会话（歌名/歌手/播放状态）。
+
+             为什么非得是通知监听？因为第三方 App 调 MediaSessionManager
+             .getActiveSessions() 会抛 SecurityException——MEDIA_CONTENT_CONTROL
+             是签名级权限，只发给系统应用。官方给第三方留的唯一口子就是：
+             自己是个**已被用户启用**的通知监听器，然后拿自己的 ComponentName
+             去调 getActiveSessions()。Android 14/15/16 都没动这个 API 本身
+             （15 新增的只是「通知里的验证码不许读」，跟媒体无关）。
+
+             代价：这个权限 **requestPermissions 要不来**，必须让用户自己去
+             「设置 → 通知使用权」里手动勾一次。所以 Dart 那边是
+             hasPermission（问状态）+ openSettings（送人过去）两个方法，
+             跟 AppUsageChannel 对 PACKAGE_USAGE_STATS 的写法一模一样，
+             中间不假装能自动搞定。
+
+             exported="true" 是安全的：这个服务被 BIND_NOTIFICATION_LISTENER_SERVICE
+             保护，而那个权限只有系统持有（CTS 和 Flutter 的同类插件都这么声明）。
+             Android 12 起有 intent-filter 的组件必须显式写 exported，不写直接装不上。
+
+             实测（2026-09-27，PKT110 / Android 16）：网易云的会话和元数据都读得到，
+             dispatch play/pause 也生效；但**它停止播放后会把 metadata 清空**
+             （size 从 12 变 0，进程和会话都还在）——兜底逻辑见 MusicBridge。 -->
+        <service
+            android:name=".MusicListenerService"
+            android:label="@string/app_name"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService"/>
+            </intent-filter>
+        </service>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

@@ -6,6 +6,7 @@ import '../config/api_keys.dart';
 import '../models/chat_message.dart';
 import '../models/mcp_tool.dart';
 import 'chat_images.dart';
+import 'music_service.dart';
 
 /// 把时间戳格式化并拼在消息内容前面，让模型能看到每条消息的发生时间。
 String _withTimestamp(String content, DateTime t) {
@@ -341,6 +342,69 @@ class AiClient {
     return msg.images.map(ChatImages.base64Of).whereType<String>().toList();
   }
 
+  /// 把「她现在在听什么」贴到最后一条用户消息上。
+  ///
+  /// ## 为什么必须单独有这一块
+  ///
+  /// 三期那条「AI 主动开口」的路只是**偶尔**响一次。可这个功能真正要的是
+  /// **它一直知道**：她随口提一句「这首歌」，或者问「我在听什么」，它得接得住。
+  /// 只靠主动开口，它平时就是个瞎子——那就不叫「两个人一起听」了。
+  ///
+  /// ## 为什么和记忆一样是个**块**，不走 `_withTimestamp` 那套前缀
+  ///
+  /// 那套前缀是**用户消息的一部分**，模型会当成她说过的话。这条不是她说的，
+  /// 是她那边正在发生的事，该和 [memoryContext] 一样是背景。
+  ///
+  /// ⚠️ 顺序：这个必须在 [_attachMemory] **之前**调。它俩都是「往最后一条用户
+  /// 消息前面插一段」，后插的在外层——`_attachMemory` 里那个 `---` 分隔符是
+  /// 紧挨着她的原话的，得让它保持在那儿。这样现在的顺序是
+  /// `记忆 / --- / 在听什么 / 她的话`：两块都是背景，而最新鲜的那条离她的话最近。
+  ///
+  /// ⚠️ **判据是「有没有活着的播放器」，不是「悬浮条挂没挂着」**
+  /// （[MusicService.hasLivePlayer]，**故意不用 `showMiniPlayer`**）。
+  /// 暂停了悬浮条收回去，可她听的还是那首——模型这时候更应该知道，因为她
+  /// 很可能就是停下来想聊两句。
+  ///
+  /// ⚠️ 后台 isolate 里 `MusicService.instance.now` 是 null（Provider 树是主
+  /// isolate 的），于是这里直接返回。不是 bug，见 [MusicService] 的类注释。
+  static void _attachNowPlaying(List<Map<String, dynamic>> apiMessages) {
+    final svc = MusicService.instance;
+    if (!svc.hasLivePlayer) return;
+    final now = svc.now;
+    final title = now?.track.title;
+    if (now == null || title == null || title.isEmpty) return;
+
+    final artist = now.track.artist;
+    final total = now.track.duration;
+    final at = now.livePosition;
+
+    final block =
+        '（这不是 TA 说的话，是 TA 那边此刻正在发生的事：'
+        '正在听《$title》${(artist ?? '').isEmpty ? '' : '（$artist）'}，'
+        '${now.state.label}'
+        '${total == null ? '' : '，${_mmss(at)} / ${_mmss(total)}'}。）\n\n';
+
+    final idx = apiMessages.lastIndexWhere((m) => m['role'] == 'user');
+    if (idx < 0) return;
+    final content = apiMessages[idx]['content'];
+    if (content is String) {
+      apiMessages[idx] = {...apiMessages[idx], 'content': '$block$content'};
+    } else if (content is List) {
+      apiMessages[idx] = {
+        ...apiMessages[idx],
+        'content': [
+          {'type': 'text', 'text': block},
+          ...content,
+        ],
+      };
+    }
+  }
+
+  static String _mmss(Duration d) {
+    final s = d.inSeconds.clamp(0, 24 * 3600);
+    return '${s ~/ 60}:${(s % 60).toString().padLeft(2, '0')}';
+  }
+
   static void _attachMemory(
     List<Map<String, dynamic>> apiMessages,
     String? memoryContext,
@@ -483,6 +547,9 @@ class AiClient {
 
     // 记忆挂在尾部，必须在 _repairToolMessages 之前——那一步会按 tool_call_id
     // 重排消息，之后再挂就可能挂错位置。
+    // 顺序：先听歌，再记忆。两边都是往最后一条用户消息前面插，后插的在外层
+    // ——`_attachMemory` 那个 `---` 得留在紧挨她原话的位置。详见它俩的注释。
+    _attachNowPlaying(apiMessages);
     _attachMemory(apiMessages, memoryContext);
 
     // 兜底：确保每个 assistant 的 tool_calls 都有对应的 tool 响应。
@@ -861,6 +928,9 @@ class AiClient {
       }
     }
 
+    // 顺序：先听歌，再记忆。两边都是往最后一条用户消息前面插，后插的在外层
+    // ——`_attachMemory` 那个 `---` 得留在紧挨她原话的位置。详见它俩的注释。
+    _attachNowPlaying(apiMessages);
     _attachMemory(apiMessages, memoryContext);
 
     final body = <String, dynamic>{

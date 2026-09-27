@@ -1,4 +1,6 @@
-import 'package:flutter/foundation.dart';
+import 'dart:async';
+
+import 'package:flutter/widgets.dart';
 import 'package:workmanager/workmanager.dart';
 
 import 'app_providers.dart';
@@ -74,6 +76,82 @@ class NudgeScheduler {
   /// 延时比冷启动短得多：这会儿没有首屏要画，只需要躲开切回来那一下的动画。
   static Future<void> runOnResume() =>
       _runLocal(settle: const Duration(milliseconds: 600));
+
+  // ---------------- 换歌那条路（三期） ----------------
+
+  /// 换歌之后停多久再评估。
+  ///
+  /// **防抖是这儿的主要目的**：她连切五首歌，只该评估一次。这 25 秒里她要是
+  /// 又切了，定时器重来，前面那几首就一起塌缩进「连着翻了好多首」那句里——
+  /// 而那正是这几首里唯一值得说的东西。不防抖的话，五首歌就是五次 API，
+  /// 其中四次只能得到「不说」。
+  ///
+  /// 也不能太短：播放器在曲目边界会连着报好几次状态，太短会在同一首歌上
+  /// 反复触发。
+  static const musicSettle = Duration(seconds: 25);
+
+  static Timer? _musicTimer;
+
+  /// 换歌了。`MusicService.onTrackChanged` 挂的就是这个。
+  ///
+  /// ⚠️ 这里**只定时，不评估**。评估要读盘、可能要调模型，而这是从原生事件
+  /// 回调里叫起来的——在那一帧上干活会直接掉帧，和 [_runLocal] 那个 `settle`
+  /// 是同一个理由。何况这会儿她多半正在看屏幕。
+  static void onTrackChanged() {
+    _musicTimer?.cancel();
+    _musicTimer = Timer(musicSettle, () => unawaited(_runMusic()));
+  }
+
+  /// 进程内，重启就忘。
+  ///
+  /// 忘了也不要紧：[NudgeService] 那道闸是拿**盘里的**「上次说话时间」算的，
+  /// 重启之后照样压得住。这个只是提前一步——连模型都不调。
+  static DateTime? _lastMusicRun;
+
+  /// 音乐那条路现在开不开。纯的，好测。
+  ///
+  /// ⚠️ 这道闸挡的不是「说不说话」，是**「白调一次模型」**。[decideNudge] 里
+  /// 那条 `minGapForMusic` 是它的下游，可那条只有等模型读完 prompt 回了「不说」
+  /// 才会发现「间隔不够」——而钱已经花了。一次换歌就够一次 API，一个下午几十
+  /// 次，那笔钱该在这儿省下来。
+  ///
+  /// 所以两道都要：这儿管「别问」，那儿管「别说」，两件事。
+  static bool shouldAskAboutMusic(
+    DateTime now,
+    DateTime? last, {
+    required Duration gap,
+  }) => last == null || now.difference(last) >= gap;
+
+  /// 换歌之后真去看一眼「要不要说句话」。
+  static Future<void> _runMusic() async {
+    final now = DateTime.now();
+    try {
+      final prefs = await NudgeService.loadPrefs();
+      if (!prefs.enabled) return;
+      if (!shouldAskAboutMusic(now, _lastMusicRun, gap: prefs.minGapForMusic)) {
+        return;
+      }
+      _lastMusicRun = now;
+
+      final client = await buildStoredAiClient();
+      if (client == null) return;
+
+      // ⚠️ 和 [_runLocal] 那条路**不一样**：那条一定是前台的（她刚切回来），
+      // 这条两种都可能。App 退到后台而进程还活着是很常见的情形——那正是她
+      // 在听歌的时候。所以这儿得现问一句。
+      //
+      // 前台不弹通知：为一条她马上就能看到的对话消息再弹一条，是噪音。
+      final foreground =
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+      await NudgeService.run(
+        aiClient: client,
+        scope: NudgeScope.musicOnly,
+        notify: !foreground,
+      );
+    } catch (e) {
+      debugPrint('[nudge] 换歌这次没跑成：$e');
+    }
+  }
 
   /// 上一次在前台跑是什么时候。**进程内的，重启就忘**——冷启动本来就会跑一次，
   /// 忘掉正好对上。

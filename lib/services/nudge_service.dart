@@ -10,7 +10,9 @@ import 'ai_client.dart';
 import '../config/persona.dart';
 import 'capsule_texts.dart';
 import 'chat_images.dart';
+import 'listen_log.dart';
 import 'memory_context.dart';
+import 'music_service.dart';
 import 'notify_name.dart';
 import 'screen_glance.dart';
 import 'vision_service.dart';
@@ -75,9 +77,17 @@ class NudgeService {
   static const _kLastRun = 'nudge_last_run';
   static const _kMentioned = 'nudge_mentioned';
 
-  /// 记住多少条「已经提过的事」。留得住几十件就够——超出这个数的信和日记，
-  /// 早就不是「刚发生」的了，本来也不该再当由头。
-  static const _mentionedKeep = 60;
+  /// 记住多少条「已经提过的事」。超出这个数的旧事，早就不是「刚发生」的了，
+  /// 本来也不该再当由头。
+  ///
+  /// ⚠️ 从 60 提到 300 是三期带出来的。原来一天也产生不了几条登记名，60 是个
+  /// 很宽的窗口；**听歌那条一接进来量级就变了**——它 20 分钟就能说一次，连着
+  /// 听一下午就是十几条，而登记表是**一个 FIFO 混着放**的：歌名会把信和日记的
+  /// 登记名挤出去，于是「一封没读的信」过几天又被念叨一次。
+  ///
+  /// 那正是这块最在意的那个失败（「变味的不是那句话，是说第二遍」），而代价
+  /// 只是 prefs 里多几百个短字符串。宁可留宽。
+  static const _mentionedKeep = 300;
 
   /// 拿多少条历史去比重复。太少挡不住轮流复读，太多会把正常的相似话题也误杀。
   static const _recentKeep = 6;
@@ -417,7 +427,56 @@ class NudgeService {
       }
     } catch (_) {}
 
+    // 她刚才在听什么。**排在最末尾**——[_pick] 是「没有便签就取第一个」，
+    // 放最后等于「别的都由头都比它优先」，正是想要的：信和日记一天出不了几回，
+    // 听歌一个下午几十首。
+    final music = await musicCandidate();
+    if (music != null) out.add(music);
+
     return out;
+  }
+
+  /// 她刚才在听什么，够不够格当一条由头。
+  ///
+  /// 判断「有话说没有」那半在 [musicBriefFor] 里（纯函数，能单测）；这里只管
+  /// **把外部世界接上**：读流水、问她现在在听什么、包成 [NudgeCandidate]。
+  static Future<NudgeCandidate?> musicCandidate() async {
+    try {
+      final entries = await ListenLog.recent();
+      if (entries.isEmpty) return null;
+      final brief = musicBriefFor(
+        entries: entries,
+        now: DateTime.now(),
+        mentioned: await _mentioned(),
+        playing: _playingBrief(),
+      );
+      if (brief == null) return null;
+      return NudgeCandidate(
+        '她在听什么',
+        brief.what,
+        mentionKey: brief.mentionKey,
+        music: true,
+      );
+    } catch (_) {
+      // 听歌记录读不出来就当没这回事。这条路的失败绝不该把别的话也堵住。
+      return null;
+    }
+  }
+
+  /// 现在这一台播放器在放什么，转成 `listen_log` 认的那个值对象。
+  ///
+  /// ⚠️ [`MusicService`] **只在主 isolate 里有东西**（见它的类注释：Provider
+  /// 树是主 isolate 的）。后台那一趟 workmanager 里 `instance.now` 是 null，
+  /// 于是这里返回 null——后台的 prompt 只会看到「刚才听了什么」，看不到
+  /// 「现在在放什么」。那不是 bug，是那条通道本来就没连到后台去。
+  static NowPlayingBrief? _playingBrief() {
+    final n = MusicService.instance.now;
+    if (n == null) return null;
+    return NowPlayingBrief(
+      title: n.track.title,
+      artist: n.track.artist,
+      state: n.state.label,
+    );
   }
 
   /// [force] 给设置页那个「现在试一次」用：跳过门槛，但**不跳过候选**——
@@ -431,11 +490,13 @@ class NudgeService {
     required AiClient aiClient,
     bool force = false,
     bool notify = true,
+    NudgeScope scope = NudgeScope.all,
   }) async {
     final r = await _runInner(
       aiClient: aiClient,
       force: force,
       notify: notify,
+      scope: scope,
     );
     await _recordRun(r.sent ? '说了：${r.text}' : r.message);
     return r;
@@ -445,6 +506,7 @@ class NudgeService {
     required AiClient aiClient,
     bool force = false,
     bool notify = true,
+    NudgeScope scope = NudgeScope.all,
   }) async {
     final now = DateTime.now();
     final sp = await SharedPreferences.getInstance();
@@ -459,8 +521,20 @@ class NudgeService {
     //
     // 换顺序不亏：收候选全是本地读，和门槛一样便宜。真正贵的是模型那一步，
     // 它仍然排在两者之后。
-    final candidates = await collectCandidates(since: lastNudge);
+    final List<NudgeCandidate> candidates;
+    if (scope == NudgeScope.musicOnly) {
+      final m = await musicCandidate();
+      candidates = m == null ? const <NudgeCandidate>[] : <NudgeCandidate>[m];
+    } else {
+      candidates = await collectCandidates(since: lastNudge);
+    }
     if (candidates.isEmpty) {
+      // 换歌触发的那一趟**到此为止**。它绝不能退到「看一眼屏幕」——她切了首
+      // 歌，凭什么顺带被看一次屏幕？那两件事之间一点关系都没有，而「看一眼」
+      // 是要调模型的。
+      if (scope == NudgeScope.musicOnly) {
+        return NudgeRunResult.nothingHappened();
+      }
       // 手上没有事。原来到这儿就结束；她允许的话，好久没说话时它可以
       // 看一眼屏幕。那是另一条路，规矩见 [_runGlance]。
       //
@@ -489,6 +563,9 @@ class NudgeService {
         now: now,
         prefs: prefs,
         isFollowUp: picked.noteId != null,
+        // 各挑各的间隔。便签 20 分钟、音乐 20 分钟、别的 1 小时——挡的是什么
+        // 见 NudgePrefs 那几个字段的注释。
+        isMusic: picked.music,
         lastChatAt: await lastChatAt(),
         lastNudgeAt: lastNudge,
       );
@@ -1189,10 +1266,17 @@ ${await _glanceContext()}
 
     // 人称约定和 musing_generator / history_compactor 一致：
     // 「你」是模型自己，「TA」是用户。
+    //
+    // 抬头分两种：别的那几条都是「你这边有东西要给她看」，听歌这条是
+    // 「她那边刚发生了件事」。照抄前者会让它去硬凑一件自己的事——「我也在
+    // 听歌」就是这么来的。
+    final head = candidate.music ? 'TA 那边刚发生了一件事：' : '你这边有一件事：';
+    final guidance = candidate.music ? _musicGuidance : _thingGuidance;
+
     return '''
 现在是 ${now.hour} 点，TA 没有在跟你说话。
 
-你这边有一件事：
+$head
 
 $list
 
@@ -1201,12 +1285,23 @@ ${digest.isEmpty ? '' : '$digest\n'}${tail.isEmpty ? '你们最近没说过话�
 要是这会儿值得说，就用一句话告诉 TA。40 字以内，像随手发一条微信。
 说那件事本身：它是什么、你为什么这会儿想起它。
 
+如果这会儿不值得为它打扰 TA，**只回两个字：不说**。
+多数时候就该这样，这不是失败。
+
+$guidance
+
+不要问问题。这是一条通知，TA 可能只是看一眼就放下。
+''';
+  }
+
+  /// 别的由头（信、日记、便签、纸条、备注）的判据。
+  ///
+  /// ⚠️ **不贴反面例句的原文**，只写正面的判据。贴了例句，它会照着那句换个
+  /// 词交上来——而用户明确要求过不要固定话术。
+  static const _thingGuidance = '''
 **时间本身就是信息。** 刚写完的信和放了三天没被打开的信，值得说的东西不一样，
 语气也不一样——三天前那封，重点已经不是「我写了」，而是它还在那儿。
 这个分寸你自己拿捏，不用问。
-
-如果这会儿不值得为它打扰 TA，**只回两个字：不说**。
-多数时候就该这样，这不是失败。
 
 写完之后自己过一遍这三条，有一条不过就重写：
 
@@ -1215,11 +1310,46 @@ ${digest.isEmpty ? '' : '$digest\n'}${tail.isEmpty ? '你们最近没说过话�
 2. 主语是你自己这边的事吗？说的是你做了什么、想起了什么。
 3. TA 读完之后不回，会不会觉得欠了你什么？会的话就重写——
    这条只是送到，不是来讨回应的。
-
-不要问问题。这是一条通知，TA 可能只是看一眼就放下。
 ''';
-  }
+
+  /// 听歌那条的判据。
+  ///
+  /// 为什么不复用上面那三条：那三条的中心是「你这边有一件东西」，听歌这条的
+  /// 中心是**她那边刚发生的事**。第一条在这儿根本不适用（具体的东西就是那首
+  /// 歌，上面已经写清楚了），第二条更是反的——照那三条写，它就只能去硬凑一件
+  /// 自己的事。
+  ///
+  /// ⚠️ 整段的重点是**把频率压下去**。这不是保守，是这类功能唯一的失败方式：
+  /// 一次换歌本身没什么好说的，人换歌太频繁了。宁可它一天只说一次，也不要它
+  /// 每切一首就搭一句——那样她三天之内就会把主动说话整个关掉。
+  static const _musicGuidance = '''
+这一件和别的不一样：它不是你的东西，是 TA 那边刚发生的事。
+
+所以别的那几条自检在这儿**不适用**——不用去找一件自己的东西来说。
+
+要判断的只有一件事：**这会儿说一句，是陪伴还是打扰。**
+
+- 换一次歌**本身不值得说话**。人换歌太频繁了，每首都搭一句就是弹幕。
+  多数时候该回「不说」——这不是没话说，是分寸。
+- 一首歌安安稳稳放完了，也**不值得**说话。那是最正常的一种，里面没有意外。
+- 值得说的是**那个动作里有东西**的时候：切得急、来回折腾同一首、连着翻了好
+  多首、某一首反复出现——那种「今天好像不太一样」的时刻。
+- **拿不准就回「不说」**。宁可少说十次，不要多说一次。
+
+说的话对着**那件事**说，不是对着歌说。不要乐评、不要推荐歌单、不要问
+「你也喜欢这个歌手吗」——你不是音乐 App，你是刚好也在旁边的那个人。
+''';
 }
+
+/// 这一趟**允许看哪几类由头**。
+///
+/// 加它是因为三期要一条自己的触发路径：换歌是实时的事，等不了后台那 15 分钟
+/// 一轮。可那趟评估要是收了全部候选，就会出事——手上正好有封没读的信，于是
+/// 「她切了首歌」变成了「信被推出去」，时机完全对不上。
+///
+/// [musicOnly] 还有一条硬规矩：**没有音乐由头就到此为止**，不许退到「看一眼
+/// 屏幕」（见 [_runInner]）。看一眼是要调模型的，切歌不该引出那件事。
+enum NudgeScope { all, musicOnly }
 
 /// 一件真发生过的事，够格当作「他想开口」的由头。
 ///
@@ -1255,6 +1385,15 @@ class NudgeCandidate {
   /// 便签留的时候说了「到点先看一眼屏幕」。见 [SelfNote.glance]。
   final bool glance;
 
+  /// 这条是从「她刚才在听什么」来的。三期加的。
+  ///
+  /// 单独标出来只为一件事：间隔那道闸对音乐松一些（[NudgePrefs.minGapForMusic]），
+  /// 而 [_composePrompt] 也要换一段判据——听歌这条的中心是她那边刚发生的事，
+  /// 不是「你这边有一件东西」，照抄别的会逼它去硬凑一件自己的事。
+  ///
+  /// ⚠️ **静默时段和「刚聊完」对它一个字都不松**，见 [decideNudge]。
+  final bool music;
+
   const NudgeCandidate(
     this.kind,
     this.what, {
@@ -1262,6 +1401,7 @@ class NudgeCandidate {
     this.noteId,
     this.mentionKey,
     this.glance = false,
+    this.music = false,
   });
 }
 

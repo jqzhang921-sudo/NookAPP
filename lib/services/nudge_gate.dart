@@ -88,6 +88,25 @@ class NudgePrefs {
   /// ⚠️ **便签不受这条约束**，见 [decideNudge]。
   final Duration minSilenceAfterChat;
 
+  /// 换歌引出来的那类开口，两条之间至少隔多久。
+  ///
+  /// 单开一条是因为**量级差太远**。上面那 1 小时压的是「她写了一句话、说了
+  /// 一件没说完的事」这种一天出不了几回的事；听歌不一样，一个下午能切几十首。
+  /// 沿用 1 小时的话，音乐这条路会整天被那条闸按着，等于白接；反过来把它整个
+  /// 松开又会让它变成每首歌都来一句的播报机。
+  ///
+  /// ⚠️ 这个数用的是**同一趟里的两处**：一处是「要不要为这件事去问模型」
+  /// （[shouldAskAboutMusic]），一处是「模型说想开口，准不准」。所以调小它
+  /// 不只是让 AI 更能开口，**API 调用量会同比例涨**——每多一次机会就是一次
+  /// 完整的模型调用（人设 + 记忆那一大坨 prompt）。
+  ///
+  /// 2026-09-27 用户听完取舍后要求「再缩小」，从 20 分钟改到 **8 分钟**：
+  /// 一首歌四五分钟，8 分钟约等于「每听完整一首之后才允许再想一次」，
+  /// 快切的时候靠换歌后那 25 秒的合并塌缩成一次，不会一首一次。
+  ///
+  /// ⚠️ 这一条**不影响别的种类**：音乐冷却短，不代表便签也能五分钟一条。
+  final Duration minGapForMusic;
+
   const NudgePrefs({
     this.enabled = false,
     this.quietStartHour = 23,
@@ -96,6 +115,7 @@ class NudgePrefs {
     this.minGapBetweenNudges = const Duration(hours: 1),
     this.minGapAfterFollowUp = const Duration(minutes: 20),
     this.minSilenceAfterChat = const Duration(hours: 1),
+    this.minGapForMusic = const Duration(minutes: 8),
   });
 
   NudgePrefs copyWith({
@@ -111,6 +131,7 @@ class NudgePrefs {
     minGapBetweenNudges: minGapBetweenNudges,
     minGapAfterFollowUp: minGapAfterFollowUp,
     minSilenceAfterChat: minSilenceAfterChat,
+    minGapForMusic: minGapForMusic,
   );
 
   Map<String, dynamic> toJson() => {
@@ -170,10 +191,15 @@ class NudgeDecision {
 ///
 /// 其余三条（开关、静默时段、保险丝）对谁都一样：那三条护的是她，
 /// 不是频率。
+///
+/// [isMusic] = 这条是「她刚才在听什么」引出来的。见 [NudgePrefs.minGapForMusic]
+/// ——它只换间隔那一条，**别的三条一个都不松**。尤其是静默时段和「刚聊完」：
+/// 歌可以半夜照听，话不能半夜照说。
 NudgeDecision decideNudge({
   required DateTime now,
   required NudgePrefs prefs,
   bool isFollowUp = false,
+  bool isMusic = false,
   DateTime? lastChatAt,
   DateTime? lastNudgeAt,
 }) {
@@ -183,12 +209,17 @@ NudgeDecision decideNudge({
     return const NudgeDecision(false, NudgeBlock.quietHours);
   }
 
-  final gap =
-      isFollowUp ? prefs.minGapAfterFollowUp : prefs.minGapBetweenNudges;
+  final gap = isFollowUp
+      ? prefs.minGapAfterFollowUp
+      : (isMusic ? prefs.minGapForMusic : prefs.minGapBetweenNudges);
   if (lastNudgeAt != null && now.difference(lastNudgeAt) < gap) {
     return const NudgeDecision(false, NudgeBlock.tooSoonAfterNudge);
   }
 
+  // 「刚聊完先待一会儿」对音乐**照样管**。她刚打完一行字，这边紧接着冒一句
+  // 「这首你听了十秒就切了」——那不是陪伴，那是盯着她。
+  //
+  // 只有便签能豁免这条（理由见上），音乐不能。
   if (!isFollowUp &&
       lastChatAt != null &&
       now.difference(lastChatAt) < prefs.minSilenceAfterChat) {

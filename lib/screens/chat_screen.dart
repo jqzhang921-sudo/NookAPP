@@ -48,6 +48,7 @@ import '../search/search_result_model.dart';
 import '../widgets/chat_message_item.dart';
 import '../widgets/background_sheet.dart';
 import '../widgets/mark_backdrop.dart';
+import '../services/music_service.dart';
 import 'settings_screen.dart';
 import 'musing_corner_screen.dart';
 import 'pc_chat_screen.dart';
@@ -1890,6 +1891,12 @@ class _ChatScreenState extends State<ChatScreen> {
     final bg = context.watch<BackgroundProvider>();
     final darkFg = bg.darkForeground ?? (theme.brightness == Brightness.light);
     final fgColor = darkFg ? const Color(0xFF171717) : Colors.white;
+
+    // 悬浮播放条挂在 App 那一层（见 `main.dart` 的 builder / `music_float.dart`），
+    // 不在这棵树上。它不知道自己在哪段对话里，而它点开的「一起听」要画两个
+    // 头像——所以在这儿放一次。放 build 里而不是发消息那一处：头像该跟着她
+    // **正在看**的那段对话，不是她最后一次说话的那段。
+    MusicService.instance.activeConversationId = _conversation.id;
 
     return PopScope(
       canPop: !_chatMode,

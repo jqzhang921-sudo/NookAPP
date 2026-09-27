@@ -44,5 +44,11 @@
         <service
             android:name="com.phonetool.screen_glance.GlanceService"
             tools:node="remove" />
+        <!-- 一起听歌也是主 App 的功能，同理。留着的话「通知使用权」那张名单里
+             会多一个「读书讨论」，而它其实什么也不做——用户勾了也没效果，
+             只会以为是坏的。 -->
+        <service
+            android:name=".MusicListenerService"
+            tools:node="remove" />
     </application>
 </manifest>

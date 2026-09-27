@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -11,10 +13,12 @@ import 'services/chat_images.dart';
 import 'services/storage_service.dart';
 import 'services/xiaoke_channel.dart';
 import 'services/external_mcp_service.dart';
+import 'services/music_service.dart';
 import 'services/nudge_scheduler.dart';
 import 'services/tts_service.dart';
 import 'services/pet_state.dart';
 import 'widgets/mochi_pet.dart';
+import 'widgets/music_float.dart';
 import 'widgets/nook_splash.dart';
 
 /// 让没有 context 的工具也能弹框问用户。
@@ -107,6 +111,12 @@ void main() async {
           },
         ),
         ChangeNotifierProvider(create: (_) => FavoritesProvider()..load()),
+        // 「一起听」。用 .value 而不是 create：MusicService.instance 是个静态
+        // 单例，原因是原生那边（系统托管的 MusicListenerService）活得比这棵
+        // Provider 树长，**推事件的时候这棵树可能还不存在**——事件先落在
+        // MusicBridge 里攒着，等这里起来了再取。用 create 的话 Provider 会
+        // 以为自己独占这个对象，dispose 时把它丢掉，单例就断了一条腿。
+        ChangeNotifierProvider.value(value: MusicService.instance),
       ],
       child: const PhoneAiApp(),
     ),
@@ -136,11 +146,20 @@ class _PhoneAiAppState extends State<PhoneAiApp> with WidgetsBindingObserver {
     // 后台被系统掐掉时的兜底：攒下的事在她打开 App 时补上。
     // 不弹通知——人已经在 App 里了。门槛照走，所以不会变吵。
     NudgeScheduler.runOnStartup();
+    // 换歌之后过 25 秒问一次「要不要说句话」。挂在这儿而不是让 nudge 那边去
+    // 监听 MusicService：换歌这个判断只有 MusicService 自己做得准（见
+    // `onTrackChanged` 的注释）。
+    MusicService.instance.onTrackChanged = NudgeScheduler.onTrackChanged;
     _autoStartMcpServer();
     // 浮在界面上那只小猫露没露着。默认不露，见 [PetState.visible]。
     PetState.load();
     // 扫一遍小猫专用图（睁眼 / 闭眼），见 [PetArt]。
     PetArt.load();
+    // 「一起听」：先把上次在听的那首从盘里捞出来填上，再去问原生现在在放什么。
+    // 两步的顺序不能反——反了的话，冷启动会先空一下再跳出歌名。
+    // warmUp 是「我们记得什么」（标着 stale），start 才是「它现在知道什么」。
+    unawaited(MusicService.instance.warmUpFromDisk());
+    unawaited(MusicService.instance.start());
   }
 
   @override
@@ -171,6 +190,10 @@ class _PhoneAiAppState extends State<PhoneAiApp> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       NudgeScheduler.runOnResume();
+      // 同理：用户可能刚在系统设置里把「通知使用权」开了或关了，而 App 这边
+      // 收不到任何通知。每次回前台都重问一遍，不然症状是「开完权限回来还是
+      // 显示没开启」，看着像坏了。
+      unawaited(MusicService.instance.start());
     }
     // 退到后台就把图片缓存还回去，理由见 [freeImageCacheForBackground]：
     // 系统清理的是「在后台占几百兆的空进程」，而进程一死，
@@ -280,8 +303,15 @@ class _PhoneAiAppState extends State<PhoneAiApp> with WidgetsBindingObserver {
               builder: (context, child) => Stack(
                 children: [
                   child ?? const SizedBox.shrink(),
-                  // ⚠️ 顺序：界面 → 小猫 → 开屏。开屏必须盖住小猫，
-                  // 否则启动那一下会看到一只猫飘在墙角动画上面。
+                  // ⚠️ 顺序：界面 → 音乐 → 小猫 → 开屏。
+                  //
+                  // 小猫盖在音乐上面是有意的：猫只有 72 宽，压在卡片角上还能
+                  // 看见大半张、也还摸得到按钮；反过来卡片会整个压住猫，那只
+                  // 猫就再也拖不动了。让小的在上面。
+                  //
+                  // 开屏必须盖住这两个，否则启动那一下会看到猫和播放条飘在
+                  // 动画上面。
+                  const MusicFloat(),
                   const MochiPet(),
                   if (_splash)
                     NookSplash(

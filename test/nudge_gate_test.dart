@@ -201,6 +201,95 @@ void main() {
   });
 
   // 主动消息的通病是重复——单条读着没问题，连着三天收到同一句就假了。
+  // 音乐那条单独一套间隔。它的量级和别的不一样：信和日记一天出不了几回，
+  // 听歌一个下午几十首。沿用 1 小时等于白接，完全松开又变成每首歌一句的
+  // 播报机——所以单开一条，而且只松这一条。
+  group('听歌那条的间隔', () {
+    test('隔 10 分钟就能说，不用等满 1 小时', () {
+      // 这一条钉的正是「它比别的松」：同样两个时刻，普通由头会被拦下。
+      // 10 分钟这个数**贴着 8 分钟那条线**（2026-09-27 从 20 调下来的），
+      // 再调大的话它会跟着失效，不会假装还测着。
+      final music = decideNudge(
+        now: at(15),
+        prefs: _on,
+        isMusic: true,
+        lastNudgeAt: at(15).subtract(const Duration(minutes: 10)),
+      );
+      expect(music.allowed, isTrue);
+      expect(music.reason, NudgeBlock.none);
+
+      final other = decideNudge(
+        now: at(15),
+        prefs: _on,
+        lastNudgeAt: at(15).subtract(const Duration(minutes: 10)),
+      );
+      expect(other.reason, NudgeBlock.tooSoonAfterNudge);
+    });
+
+    test('刚说完 5 分钟又切歌，不推', () {
+      final d = decideNudge(
+        now: at(15),
+        prefs: _on,
+        isMusic: true,
+        lastNudgeAt: at(15).subtract(const Duration(minutes: 5)),
+      );
+      expect(d.reason, NudgeBlock.tooSoonAfterNudge);
+    });
+
+    test('⚠️ 静默时段对音乐一个字都不松', () {
+      // 歌可以半夜照听，话不能半夜照说。松的只有间隔那一条。
+      final d = decideNudge(
+        now: at(2),
+        prefs: _on,
+        isMusic: true,
+        lastNudgeAt: at(1),
+      );
+      expect(d.reason, NudgeBlock.quietHours);
+    });
+
+    test('⚠️ 刚聊完也不松', () {
+      // 这次豁免的只有便签。她刚打完一行字，这边紧接着冒一句「这首你听了十秒
+      // 就切了」——那不是陪伴，那是盯着她。
+      final d = decideNudge(
+        now: at(15),
+        prefs: _on,
+        isMusic: true,
+        lastChatAt: at(15).subtract(const Duration(minutes: 20)),
+      );
+      expect(d.reason, NudgeBlock.tooSoonAfterChat);
+    });
+
+    test('没开就照旧什么都不推', () {
+      final d = decideNudge(
+        now: at(15),
+        prefs: const NudgePrefs(), // enabled 默认 false
+        isMusic: true,
+      );
+      expect(d.reason, NudgeBlock.disabled);
+    });
+
+    test('音乐冷却和便签冷却互不影响', () {
+      // 同一个时刻、同一条「上回开口是 10 分钟前」，只有种类不同——音乐放行，
+      // 便签照旧拦下。这一条钉的就是「两个是各算各的」，别哪天顺手把音乐那条
+      // 也接到便签的冷却上去。
+      final music = decideNudge(
+        now: at(15),
+        prefs: _on,
+        isMusic: true,
+        lastNudgeAt: at(15).subtract(const Duration(minutes: 10)),
+      );
+      expect(music.allowed, isTrue); // 10 > 8
+
+      final followUp = decideNudge(
+        now: at(15),
+        prefs: _on,
+        isFollowUp: true, // 便签走 20 分钟那条
+        lastNudgeAt: at(15).subtract(const Duration(minutes: 10)),
+      );
+      expect(followUp.reason, NudgeBlock.tooSoonAfterNudge); // 10 < 20
+    });
+  });
+
   group('别把同一天过第二遍', () {
     test('换了标点和语序，仍然算同一句', () {
       const recent = ['我刚写完一封信，放在栖息里了'];

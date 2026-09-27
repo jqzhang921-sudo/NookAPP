@@ -30,6 +30,9 @@ const _labels = <String, String>{
   'save_to_corner': 'Save to corner',
   'memory': 'Memory',
   'follow_up_later': 'Note to self',
+  // 「一起听歌」。放/停/切歌都归这一行。不叫 'Now playing' 是因为它不止是读的
+  // ——暂停也是它，写「正在播放」会把一次打断说成一次查看。
+  'music': 'Music',
   'glance_screen': 'Glance at screen',
   'add_small_thing': 'Small thing',
   'set_alarm': 'Set alarm',

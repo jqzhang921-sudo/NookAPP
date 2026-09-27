@@ -21,6 +21,7 @@ class MainActivity : FlutterActivity() {
     private val isRecording = AtomicBoolean(false)
     private var calendar: CalendarChannel? = null
     private val share = ShareIntentChannel(this)
+    private var music: MusicChannel? = null
 
     companion object {
         private const val CHANNEL = "voice_recorder"
@@ -72,6 +73,22 @@ class MainActivity : FlutterActivity() {
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, ShareIntentChannel.CHANNEL)
         )
         share.onCreate(intent)
+
+        // 「一起听歌」。数据在 MusicBridge 里，这里只是把管子插上——注意
+        // **attach 这一句是必须的**，它让 MusicBridge 知道「Dart 起来了，可以
+        // 往这儿推了」；不插的话事件只会一直往 pending 里攒，界面永远不动。
+        //
+        // 用 applicationContext 的理由和上面 AppUsageChannel 一样：读媒体会话
+        // 不碰界面，没理由拿着 Activity 的引用多活一会儿（何况 MusicListenerService
+        // 是个系统服务，它活得比这个 Activity 长得多）。
+        val m = MusicChannel(applicationContext)
+        music = m
+        val musicChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            MusicChannel.CHANNEL,
+        )
+        musicChannel.setMethodCallHandler { call, result -> m.handle(call, result) }
+        MusicBridge.attach(musicChannel)
     }
 
     // launchMode 是 singleTop：App 已经开着的时候再分享一次，走的是这里，
@@ -243,6 +260,13 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         cancelRecording()
+        // FlutterActivity 默认会把引擎一起销毁，销毁之后那条 MethodChannel 就
+        // 是死的了。不断开的话，MusicListenerService 那边推事件时会往一个死
+        // 引擎里 invokeMethod——而那个服务是系统托管的，**可能在 Activity 没了
+        // 之后还活着**。断开之后事件退回 pending 攒着，下次开 App 一并取走。
+        // （这也是为什么 MusicBridge 要同时有「推」和「取」两条路。）
+        MusicBridge.detach()
+        music = null
         super.onDestroy()
     }
 }
