@@ -137,7 +137,7 @@ void main() {
     // 就是 `/chat/completions` 这种半截地址，还查不出为什么。
     final custom = pick(await ApiKeyService.loadKeys(), 'custom');
     expect(custom.endpoint, isNull);
-    expect(custom.model, 'deepseek-chat');
+    expect(custom.model, 'deepseek-flash');
   });
 
   test('没存过地址的格式，填上内置默认值', () async {

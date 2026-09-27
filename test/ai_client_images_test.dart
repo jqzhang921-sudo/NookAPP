@@ -30,8 +30,8 @@ void main() {
   });
 
   test('不能收图的格式：图得先送去转成文字', () {
-    // custom 的默认模型是 deepseek-chat（纯文本），图原样发过去会直接报错；
-    // 任意自建地址后面是什么模型，代码也没法知道。所以它得走识图兜底。
+    // custom 的默认模型 deepseek-flash 本身能收图，但「任意自建地址」后面是什么
+    // 模型代码没法知道，有的能收图、有的不能。所以它不写进表里、走识图兜底。
     for (final p in ['custom']) {
       expect(clientOf(p).sendsImagesNatively, isFalse, reason: p);
     }

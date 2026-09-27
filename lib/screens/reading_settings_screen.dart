@@ -244,7 +244,7 @@ class _ReadingSettingsScreenState extends State<ReadingSettingsScreen> {
                   _field(
                     label: '模型（留空用默认）',
                     controller: _modelController,
-                    hint: 'deepseek-chat',
+                    hint: 'deepseek-flash',
                   ),
                   const SizedBox(height: 24),
                   FilledButton(onPressed: _save, child: const Text('保存')),
@@ -256,7 +256,7 @@ class _ReadingSettingsScreenState extends State<ReadingSettingsScreen> {
                       child: Text(
                         '不知道填什么的话：\n\n'
                         '选「自定义」，地址填 https://api.deepseek.com/v1，'
-                        '模型填 deepseek-chat，'
+                        '模型填 deepseek-flash，'
                         'Key 去 platform.deepseek.com 注册后自己生成一个。\n\n'
                         '国内直连，不用梯子。',
                         style: TextStyle(

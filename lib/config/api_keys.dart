@@ -17,8 +17,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 /// 用的正是 `image_url` 这种报文。结果是**拿 MIMO 聊天时图被转给「视觉识图」，
 /// 而视觉识图又是 MIMO**，还得另配一遍 key，没配就等于没发。
 ///
-/// `custom` 仍然不写：它的默认模型是 `deepseek-chat`（纯文本），图原样发过去
-/// 会直接报错；而一个任意自建地址后面是什么模型，代码没法知道。
+/// `custom` 仍然不写：默认模型 `deepseek-flash` 本身能收图，但「任意自建地址」
+/// 后面到底是什么模型、收不收图，代码没法知道，不写、走识图兜底最稳妥。
 /// ⚠️ `mimo` 同理有个前提：选的是能看图的那个模型。改成纯文本的型号，
 /// 这里会照样放行。
 ///
@@ -87,7 +87,7 @@ class ApiKeyConfig {
       provider: 'custom',
       name: '自定义',
       endpoint: '',
-      model: 'deepseek-chat',
+      model: 'deepseek-flash',
     ),
   ];
 }
