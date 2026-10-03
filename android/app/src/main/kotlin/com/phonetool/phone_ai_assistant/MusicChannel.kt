@@ -11,9 +11,10 @@ import io.flutter.plugin.common.MethodChannel
 /**
  * 「一起听歌」的 Dart ↔ 原生管子。通道名 `music_session`。
  *
- * 数据本身全在 [MusicBridge] 里，这里只负责四件事：问权限、送人去开权限、
+ * 数据本身全在 [MusicBridge] 里，这里只负责五件事：问权限、送人去开权限、
  * 把攒下的状态和事件递出去、把播放控制（放/停/上一首/下一首/快进）转给
- * [MusicBridge.control]。**这个类不持有任何状态**——因为它是跟着 Activity
+ * [MusicBridge.control]、把 [MusicKeepAliveService] 拉起来。
+ * **这个类不持有任何状态**——因为它是跟着 Activity
  * 引擎走的，而 MusicBridge 和 [MusicListenerService] 活得比它长。
  *
  * ## 权限这条路和别的都不一样
@@ -65,6 +66,13 @@ class MusicChannel(private val context: Context) {
             // ——**故意不并进 hasPermission 里**：那一个是个纯粹的查询，
             // 而这个是会去动系统状态的，读代码的人得一眼分得出来。
             "ensureBound" -> result.success(ensureBound())
+            // 把「不让 ColorOS 冻住进程」的前台服务拉起来。见
+            // [MusicKeepAliveService] 的类注释。
+            //
+            // **必须在 App 处于前台时调**（Android 12+ 不许从后台启动前台
+            // 服务），所以调用点是 Dart 回前台那次 `MusicService.start()`。
+            // 失败返回 false 不抛——起不来最坏是回到加它之前的样子。
+            "keepAlive" -> result.success(MusicKeepAliveService.start(context))
             // 当前在放什么。null = 还没有任何会话（没在放歌，或者服务还没连上）。
             "snapshot" -> result.success(MusicBridge.snapshot())
             // 攒下的换歌/播放事件，**取走即清**。

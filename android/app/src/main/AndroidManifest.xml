@@ -25,6 +25,17 @@
          得在 App 里显式要一次（见 NudgeService.ensurePermission）。
          13 以下声明了就有，不弹框。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- 「一起听歌」的前台服务要用的两条。**都必须在源码里显式写。**
+         第一条（FOREGROUND_SERVICE）在合并产物里本来就有——那是从
+         androidx.work 的 SystemForegroundService 传进来的。**别依赖它**：
+         哪天去掉 workmanager，这个服务就会在启动时抛 SecurityException，
+         而那时候没人会想到是权限没了。
+         第二条是 targetSdk 34 起的新规矩：每种前台服务类型各自要一条权限，
+         缺了就是 SecurityException。最容易漏的就是它，因为**在 Android 13
+         及以下的机器上完全看不出来**（开发期用老机器测会一路绿灯）。
+         两条都是 install-time 普通权限，不弹框。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <application
         android:label="@string/app_name"
         android:name="${applicationName}"
@@ -92,6 +103,36 @@
                 <action android:name="android.service.notification.NotificationListenerService"/>
             </intent-filter>
         </service>
+        <!-- 「一起听歌」的保命符：一个只是为了不让进程被冻住而存在的前台服务。
+
+             它不播音频，借 mediaPlayback 这个类型只有一个目的：让进程的
+             oom_adj 落在 PERCEPTIBLE_APP_ADJ(200) 那一档，从而**掉出系统
+             cached apps freezer 的适用范围**（判据是 adj >= 900，Android 16
+             的激进模式是 >= 600）。不是求系统开恩。
+
+             实测（2026-09-27 / PKT110 / Android 16 / ColorOS）：App 切后台
+             几分钟后媒体会话回调的 binder 投递全停，拉回前台同一秒续上、
+             且没有任何重连日志——说明监听器和回调一直有效，冻的是投递。
+
+             ⚠️ 借名要知情：我们不放任何音频。侧载自用不受 Play 政策管；但
+             mediaPlayback 类型上架要提交用途说明 + 演示视频，我们过不了。
+             别把它当 bug 改掉。
+
+             exported="false"：只有我们自己 start 它，没有 intent-filter，
+             没有任何人 bind。
+             tools:targetApi="29" 是因为 foregroundServiceType 这个属性本身
+             是 API 29 才有的——低版本系统会忽略未知属性（不报错），这里只是
+             消 lint 的 UnusedAttribute 警告。
+             **不要加 android:process**：它必须和 MusicBridge、
+             MusicListenerService 待在主进程里，分出去就白干了。
+             寿命规则见 MusicKeepAliveService 的类注释——它挡不住「从最近任务
+             划掉」（ColorOS 上那等于强停，整进程连服务一起没）。 -->
+        <service
+            android:name=".MusicKeepAliveService"
+            android:label="@string/app_name"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            tools:targetApi="29" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

@@ -185,6 +185,18 @@ class MusicService extends ChangeNotifier {
     // 给系统递个话；绑上之后原生会主动推一次当前状态过来。
     unawaited(_ensureBound());
 
+    // 顺手把前台服务拉起来，**趁 App 还在前台**——这是唯一合法的时机。
+    //
+    // 为什么非要它：ColorOS 会在 App 切到后台几分钟后冻住整个进程，
+    // `MediaController.Callback` 的 binder 投递全停（判据是恢复时没有任何
+    // 重连日志）。而她听歌时人在 QQ音乐，Nook 正在后台——换歌事件根本到不了
+    // 这儿。前台服务把进程抬到 PERCEPTIBLE_APP_ADJ，直接掉出冻结器的范围。
+    //
+    // ⚠️ 位置很讲究：**必须排在上面那两个 await 之前**。_drain / _refresh
+    // 各带 3 秒超时，排在它们后面最坏会拖到 resumed 之后 6 秒——那时她可能
+    // 已经切走了，而 Android 12+ 不许从后台启动前台服务。
+    unawaited(_ensureKeepAlive());
+
     // 先把攒下的补齐（进程被杀那段时间的事件全在这儿），再要一份当前的。
     //
     // 顺序不能反：历史事件是**只进流水**的，碰不到 `_now`；要是反过来，
@@ -199,6 +211,19 @@ class MusicService extends ChangeNotifier {
     try {
       await _channel
           .invokeMethod<bool>('ensureBound')
+          .timeout(const Duration(seconds: 3));
+    } catch (_) {
+      // 不是安卓、老版本原生没有这个方法、通道卡住——都当没有这一步。
+    }
+  }
+
+  /// 见 [start] 里那段注释。和 [_ensureBound] 一个口径：失败不吭声——
+  /// 拉不起来前台服务不是她能处理的事，报了只是噪音。最坏的结果是回到加它
+  /// 之前的样子（后台被冻住），而不是功能坏掉。
+  Future<void> _ensureKeepAlive() async {
+    try {
+      await _channel
+          .invokeMethod<bool>('keepAlive')
           .timeout(const Duration(seconds: 3));
     } catch (_) {
       // 不是安卓、老版本原生没有这个方法、通道卡住——都当没有这一步。

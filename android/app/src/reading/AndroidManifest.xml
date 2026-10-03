@@ -50,5 +50,20 @@
         <service
             android:name=".MusicListenerService"
             tools:node="remove" />
+        <!-- 一起听的保命符前台服务。不删的话读书版会冒出一条「在后台听着」的
+             常驻通知——一个读书 App 弹这个比没有更糟。
+             ⚠️ 但它**必须能被引用**：MusicChannel.kt 在 main source set 里，
+             两个 flavor 共用，所以类只能放 main。这里删的是 manifest 条目，
+             不是类——删类的话 reading 变体直接编译不过。 -->
+        <service
+            android:name=".MusicKeepAliveService"
+            tools:node="remove" />
     </application>
+    <!-- 读书版没有任何前台服务，这条权限是纯负担，一并摘掉。
+         （必须在 <manifest> 下，不能塞进 <application>——lint 直接判死。）
+         ⚠️ FOREGROUND_SERVICE 那条**不要动**：WorkManager 两个 flavor 都在用
+         （SystemForegroundService 要它）。 -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+        tools:node="remove" />
 </manifest>

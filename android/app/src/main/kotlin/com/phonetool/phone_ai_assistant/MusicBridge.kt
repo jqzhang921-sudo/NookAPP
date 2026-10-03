@@ -85,6 +85,25 @@ object MusicBridge {
         private set
 
     /**
+     * 最后一次「确实在出声」的时刻（`elapsedRealtime`）。0 = 从来没出过声。
+     *
+     * 给 [MusicKeepAliveService] 判断该不该自己关用的。判据和
+     * [MusicListenerService.isAudible]、Dart 侧 `_audible` **三处对齐**：
+     * `playing` 和 `buffering` 都算——缓冲中的播放器显然就是她正在听的那个。
+     * （见 [MusicListenerService.pick] 那段注释，漏掉 buffering 是有过教训的。）
+     *
+     * ⚠️ 用 `SystemClock.elapsedRealtime()`，**不要墙钟**：墙钟会被用户改时间、
+     * 被 NTP 跳，而「过了多久」这件事只能用单调钟算。同一个坑 [positionOf]
+     * 那里的注释已经记过一次。
+     *
+     * `@Volatile` 的理由不是「现在真的跨线程了」（读写都在主线程），而是让
+     * 「这份状态是共享的」写在类型上——以后有人把心跳挪到别的线程时不会踩空。
+     */
+    @Volatile
+    var lastAudibleAt: Long = 0L
+        private set
+
+    /**
      * 「这个包现在把哪首歌挂在它自己的通知上」——由 [MusicListenerService] 在
      * 连上的时候装进来，断开时清掉。null = 那个服务没在跑，那就只能信会话。
      *
@@ -295,6 +314,17 @@ object MusicBridge {
         val stale = fresh == null && lastTrack != null
 
         val ps = c.playbackState
+
+        // 「确实在出声」的时刻。**放在 [snap] 里而不是别处，是因为它是这张表
+        // 唯一的读点**（[refresh] 和 [snapshot] 都走它），放别处一定会漏。
+        //
+        // 只在出声时更新，所以暂停之后它就冻住不动了——这正是
+        // [MusicKeepAliveService] 要的语义：「已经多久没响过了」。
+        val state = ps?.state
+        if (state == PlaybackState.STATE_PLAYING || state == PlaybackState.STATE_BUFFERING) {
+            lastAudibleAt = SystemClock.elapsedRealtime()
+        }
+
         return mutableMapOf(
             "package" to pkg,
             "title" to track?.get("title"),
@@ -302,7 +332,7 @@ object MusicBridge {
             "album" to track?.get("album"),
             "durationMs" to track?.get("durationMs"),
             KEY_STALE to stale,
-            "state" to stateName(ps?.state),
+            "state" to stateName(state),
             "positionMs" to positionOf(ps),
             "actions" to (ps?.actions ?: 0L),
             "at" to System.currentTimeMillis(),
